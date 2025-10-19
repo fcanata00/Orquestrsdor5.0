@@ -1,0 +1,11 @@
+{
+  "name": "gcc",
+  "version": "14.2.0",
+  "category": "dev",
+  "summary": "The GNU Compiler Collection",
+  "maintainer": "YourName <you@example.com>",
+  "license": "GPL-3.0-or-later",
+  "source": "https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz",
+  "checksum": "sha256:3ffcd742ecad1f58...",
+  "build_system": "autotools"
+}

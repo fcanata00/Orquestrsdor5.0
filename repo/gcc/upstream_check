@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+URL="https://gcc.gnu.org/releases.html"
+curl -s "$URL" | grep -Eo 'gcc-[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 | sed 's/gcc-//'
