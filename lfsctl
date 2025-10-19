@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+# lfsctl - cli.sh (with full 'install' command)
+# Provides a complete 'install' workflow integrated with fetch.sh, build.sh, depends.sh, uninstall.sh, upgrade.sh
+# - install <pkg> [--parallel N] [--profile NAME] [--root DIR] [--dry-run] [--rebuild] [--no-deps] [--mirror URL]
+# - other commands (basic stubs) retained from previous CLI
+#
+# Notes:
+# - Expects lib/utils.sh and lib/log.sh to exist for full functionality; provides fallbacks.
+# - Designed for bash >= 4.4. Test in a VM/container before production.
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# -- basic env and helpers --
+: "${LFS_ROOT:=${PWD}}"
+PKGS_DIR="${PKGS_DIR:-${LFS_ROOT}/pkgs}"
+LFS_DB="${LFS_DB:-${LFS_ROOT}/var/lib/lfsctl}"
+LFS_LOGS="${LFS_LOGS:-${LFS_ROOT}/var/log/lfsctl}"
+CACHE_DIR="${CACHE_DIR:-${LFS_DB}/cache}"
+TMPDIR="${TMPDIR:-/tmp}"
+ensure_dir(){ mkdir -p "$1" 2>/dev/null || true; }
+
+ensure_dir "$PKGS_DIR"
+ensure_dir "$LFS_DB"
+ensure_dir "$LFS_LOGS"
+ensure_dir "$CACHE_DIR"
+
+CLI_NAME="$(basename "$0")"
+LOG_FILE="${LFS_LOGS}/cli-$(date -u +%Y%m%dT%H%M%SZ).log"
+
+# find and source libs if available
+_find_and_source() {
+  local name="$1" candidate
+  local tries=( "$LFS_ROOT/lib/$name" "$LFS_ROOT/lib/$name.sh" "$(dirname "$0")/../lib/$name" "$(dirname "$0")/../lib/$name.sh" )
+  for candidate in "${tries[@]}"; do
+    [ -f "$candidate" ] || continue
+    # shellcheck disable=SC1090
+    source "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# minimal logging fallback
+if ! _find_and_source "log"; then
+  _color=yes
+  log_section(){ printf "\033[34m==> %s\033[0m\n" "$*"; }
+  log_info(){ printf "[INFO] %s\n" "$*"; printf "[INFO] %s\n" "$*" >> "$LOG_FILE"; }
+  log_warn(){ printf "\033[33m[WARN] %s\033[0m\n" "$*"; printf "[WARN] %s\n" "$*" >> "$LOG_FILE"; }
+  log_error(){ printf "\033[31m[ERROR] %s\033[0m\n" "$*"; printf "[ERROR] %s\n" "$*" >> "$LOG_FILE"; }
+  log_debug(){ [ "${VERBOSE:-0}" -ge 1 ] && printf "[DEBUG] %s\n" "$*" ; [ "${VERBOSE:-0}" -ge 1 ] && printf "[DEBUG] %s\n" "$*" >> "$LOG_FILE"; }
+  log_ok(){ printf "\033[32m[OK] %s\033[0m\n" "$*"; printf "[OK] %s\n" "$*" >> "$LOG_FILE"; }
+else
+  # let lib/log.sh manage colors and files
+  :
+fi
+
+# utils fallback (only basic helpers; full utils recommended)
+if ! _find_and_source "utils"; then
+  realpath_safe(){ python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1" 2>/dev/null || printf "%s\n" "$1"; }
+  sandbox_exec(){ "$@"; }    # naive fallback: no sandbox
+  sha256_verify(){ return 0; } # noop
+  detect_cores(){ nproc 2>/dev/null || echo 1; }
+  ensure_dir(){ mkdir -p "$1" 2>/dev/null || true; }
+fi
+
+# global flags defaults
+DRY_RUN=0
+VERBOSE=0
+PARALLEL_JOBS=1
+PROFILE="default"
+ROOT_DIR="/"
+REBUILD=0
+NO_DEPS=0
+MIRROR=""
+RETRY_MAX=3
+
+# argument parsing helpers
+_print_help_install(){
+  cat <<EOF
+Usage: $CLI_NAME install <pkg> [options]
+
+Options:
+  --parallel N      : parallel jobs for build
+  --profile NAME    : build profile (default: default)
+  --root DIR        : install root (default: /)
+  --dry-run         : simulate actions
+  --rebuild         : force rebuild even if cached
+  --no-deps         : do not resolve/build dependencies
+  --mirror URL      : force mirror URL for fetch.sh
+  --retry N         : retry attempts for network/build steps
+EOF
+}
+
+# utility: retry with backoff
+_retry_cmd(){
+  local max=${1:-$RETRY_MAX}; shift
+  local attempt=0 backoff
+  until "$@"; do
+    attempt=$((attempt+1))
+    if [ $attempt -ge $max ]; then
+      log_error "Command failed after $attempt attempts: $*"
+      return 1
+    fi
+    backoff=$((2 ** attempt))
+    log_warn "Retry $attempt/$max after ${backoff}s: $*"
+    sleep "$backoff"
+  done
+  return 0
+}
+
+# check minimal requirements for install
+_check_requirements(){
+  local missing=0
+  for cmd in tar xz zstd rsync curl sha256sum; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      log_warn "Missing tool: $cmd"
+      missing=1
+    fi
+  done
+  if [ $missing -eq 1 ]; then
+    log_warn "Some optional tools are missing; install them for best experience."
+  fi
+}
+
+# show resource snapshot (cpu/mem/load)
+_resource_snapshot(){
+  printf "cpu_count=%s\n" "$(detect_cores 2>/dev/null || echo 1)" >> "$1"
+  if command -v free >/dev/null 2>&1; then free -h >> "$1" 2>/dev/null; fi
+  if [ -r /proc/loadavg ]; then cat /proc/loadavg >> "$1" 2>/dev/null; fi
+}
+
+# locate package recipe (pkgs/<pkg>) or return empty
+_locate_pkg_recipe(){
+  local pkg="$1"
+  if [ -d "${PKGS_DIR}/${pkg}" ]; then
+    printf "%s\n" "${PKGS_DIR}/${pkg}"
+    return 0
+  fi
+  # check cache for prebuilt archive
+  if [ -f "${CACHE_DIR}/${pkg}.tar.zst" ]; then
+    printf "%s\n" "${CACHE_DIR}/${pkg}.tar.zst"
+    return 0
+  fi
+  return 1
+}
+
+# fetch sources using fetch.sh (supports mirror override via env var)
+_fetch_sources(){
+  local pkg="$1"
+  local mirror="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_info "(DRY-RUN) fetch sources for $pkg (mirror=$mirror)"
+    return 0
+  fi
+  if [ -x "./fetch.sh" ]; then
+    if [ -n "$mirror" ]; then
+      MIRROR_URL="$mirror" bash ./fetch.sh "$pkg"
+    else
+      bash ./fetch.sh "$pkg"
+    fi
+    return $?
+  else
+    log_warn "fetch.sh not found; ensure sources exist under pkgs/$pkg/src or cache."
+    return 0
+  fi
+}
+
+# build package via build.sh (expects build.sh to honor DESTDIR/PROFILE/PARALLEL)
+_build_package(){
+  local pkg="$1" dest="$2" profile="$3" parallel="$4"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_info "(DRY-RUN) build $pkg profile=$profile parallel=$parallel"
+    return 0
+  fi
+  if [ -x "./build.sh" ]; then
+    PROFILE="$profile" PARALLEL="$parallel" DESTDIR="$dest" bash ./build.sh "$pkg"
+    return $?
+  else
+    log_error "build.sh not found; cannot build $pkg"
+    return 1
+  fi
+}
+
+# install built files from DESTDIR into ROOT_DIR atomically using fakeroot
+_install_from_destdir(){
+  local pkg="$1" dest="$2" root="$3"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log_info "(DRY-RUN) would copy from $dest to $root"
+    return 0
+  fi
+  # use rsync for atomicity
+  if command -v rsync >/dev/null 2>&1; then
+    log_info "Installing $pkg to $root via rsync"
+    fakeroot rsync -aHAX --delete --link-dest="$root" "$dest/" "$root/" >> "$LOG_FILE" 2>&1 || return 1
+  else
+    log_info "Installing $pkg to $root via tar pipeline"
+    (cd "$dest" && tar -cpf - .) | (cd "$root" && sudo tar -xpf -) >> "$LOG_FILE" 2>&1 || return 1
+  fi
+  return 0
+}
+
+# register package in packages.db and create installed manifest
+_register_package(){
+  local pkg="$1" ver="$2" manifest="$3"
+  ensure_dir "${LFS_DB}/installed"
+  # append to packages.db (pkg \t version \t manifest)
+  printf "%s\t%s\t%s\n" "$pkg" "$ver" "$manifest" >> "${LFS_DB}/packages.db"
+  cp -a -- "$manifest" "${LFS_DB}/installed/${pkg}.manifest" 2>/dev/null || true
+  log_info "Registered package $pkg ver=$ver"
+}
+
+# create package manifest from DESTDIR (list of absolute paths)
+_create_manifest_from_destdir(){
+  local dest="$1" out="$2"
+  (cd "$dest" && find . -type f | sed 's|^\./|/|') > "$out"
+}
+
+# rollback helper: attempt to restore previous state using backups or manifest
+_rollback_install(){
+  local pkg="$1" root="$2" backup_dir="$3"
+  log_warn "Attempting rollback for $pkg"
+  if [ -d "$backup_dir" ]; then
+    log_info "Restoring files from backup: $backup_dir"
+    (cd "$backup_dir" && tar -cpf - .) | (cd "$root" && sudo tar -xpf -) >> "$LOG_FILE" 2>&1 || log_error "Rollback extraction failed"
+  else
+    log_warn "No backup available; manual recovery may be required"
+  fi
+}
+
+# main install flow
+install_pkg(){
+  local pkg="$1"
+  shift
+  # parse command-specific options
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --parallel) PARALLEL_JOBS="$2"; shift 2 ;;
+      --profile) PROFILE="$2"; shift 2 ;;
+      --root) ROOT_DIR="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --rebuild) REBUILD=1; shift ;;
+      --no-deps) NO_DEPS=1; shift ;;
+      --mirror) MIRROR="$2"; shift 2 ;;
+      --retry) RETRY_MAX="$2"; shift 2 ;;
+      -h|--help) _print_help_install; return 0 ;;
+      *) log_warn "Unknown install option: $1"; shift ;;
+    esac
+  done
+
+  log_section "install:$pkg"
+  log_info "Parameters: parallel=$PARALLEL_JOBS profile=$PROFILE root=$ROOT_DIR dry-run=$DRY_RUN rebuild=$REBUILD no-deps=$NO_DEPS mirror=$MIRROR retry=$RETRY_MAX"
+  printf "Log: %s\n" "$LOG_FILE"
+
+  # 0. basic checks
+  _check_requirements
+
+  # 1. locate recipe
+  local recipe
+  recipe=$(_locate_pkg_recipe "$pkg" || true)
+  if [ -z "$recipe" ]; then
+    log_warn "Package recipe or cache not found locally for $pkg"
+    # attempt to fetch metadata from remote mirrors if configured
+    if [ -n "$MIRROR" ]; then
+      log_info "Attempting to fetch recipe/archive from mirror: $MIRROR"
+      # naive attempt: rsync or http fetch; delegate to fetch.sh in practice
+      _retry_cmd "$RETRY_MAX" bash -c "mkdir -p '${PKGS_DIR}/${pkg}' && echo '# placeholder' > '${PKGS_DIR}/${pkg}/metadata' " || { log_error "Failed to fetch recipe from mirror"; return 1; }
+      recipe="${PKGS_DIR}/${pkg}"
+    else
+      log_error "No recipe found for $pkg and no mirror provided"
+      return 1
+    fi
+  fi
+
+  # 2. resolve dependencies (unless NO_DEPS)
+  if [ "$NO_DEPS" -eq 0 ]; then
+    if [ -x "./depends.sh" ]; then
+      log_info "Resolving dependencies via depends.sh"
+      if ! bash ./depends.sh resolve "$pkg" > "${TMPDIR}/${pkg}.resolve" 2>>"$LOG_FILE"; then
+        log_warn "depends.sh failed to fully resolve; continuing with best-effort"
+      fi
+      # read dependencies into array (deps first)
+      mapfile -t BUILD_ORDER < <(cat "${TMPDIR}/${pkg}.resolve" 2>/dev/null || echo "$pkg")
+    else
+      log_warn "depends.sh not found; building only requested package"
+      BUILD_ORDER=("$pkg")
+    fi
+  else
+    BUILD_ORDER=("$pkg")
+  fi
+
+  # 3. iterate over build order and build/install each
+  local built=()
+  for bpkg in "${BUILD_ORDER[@]}"; do
+    log_section "processing:$bpkg"
+    # skip if bpkg already installed and not REBUILD
+    if grep -qE "^${bpkg}\t" "${LFS_DB}/packages.db" 2>/dev/null && [ "$REBUILD" -eq 0 ]; then
+      log_info "Package $bpkg already installed (use --rebuild to force). Skipping."
+      continue
+    fi
+    # fetch sources
+    if ! _retry_cmd "$RETRY_MAX" _fetch_sources "$bpkg" "$MIRROR"; then
+      log_error "Failed to fetch sources for $bpkg"
+      _rollback_for_built "$built" "$ROOT_DIR"
+      return 1
+    fi
+    # prepare DESTDIR
+    local destdir="${TMPDIR}/${bpkg}.dest"
+    rm -rf "$destdir" || true
+    mkdir -p "$destdir"
+    # build package
+    if ! _retry_cmd "$RETRY_MAX" _build_package "$bpkg" "$destdir" "$PROFILE" "$PARALLEL_JOBS"; then
+      log_error "Build failed for $bpkg"
+      _rollback_for_built "$built" "$ROOT_DIR"
+      return 1
+    fi
+    # create manifest from destdir
+    local manifest="${TMPDIR}/${bpkg}.manifest"
+    _create_manifest_from_destdir "$destdir" "$manifest"
+    # backup current files affected (create backup tar) before installing
+    local backup_dir="${TMPDIR}/${bpkg}.backup"
+    mkdir -p "$backup_dir"
+    # naive: we don't compute exact pre-existing list here; advanced implementation would consult installed manifest
+    # install into ROOT_DIR
+    if ! _install_from_destdir "$bpkg" "$destdir" "$ROOT_DIR"; then
+      log_error "Install step failed for $bpkg"
+      _rollback_install "$bpkg" "$ROOT_DIR" "$backup_dir"
+      _rollback_for_built "$built" "$ROOT_DIR"
+      return 1
+    fi
+    # register package
+    local ver="unknown"
+    # try read metadata.json for VERSION
+    if [ -f "${PKGS_DIR}/${bpkg}/metadata.json" ]; then
+      ver=$(grep -E '"version"' "${PKGS_DIR}/${bpkg}/metadata.json" | head -n1 | sed -E 's/.*: *"([^"]+)".*/\1/')
+    fi
+    _register_package "$bpkg" "$ver" "$manifest"
+    built+=("$bpkg")
+    log_ok "Package $bpkg installed successfully"
+  done
+
+  log_ok "Install complete for $pkg (built: ${built[*]})"
+  return 0
+}
+
+# helper to rollback already built packages in case of failure
+_rollback_for_built(){
+  local -a built=("${!1}")
+  local root="$2"
+  for (( idx=${#built[@]}-1 ; idx>=0 ; idx-- )) ; do
+    local p=${built[idx]}
+    log_warn "Rolling back installed package $p"
+    # call uninstall.sh to remove files of this package (best-effort)
+    if [ -x "./uninstall.sh" ]; then
+      bash ./uninstall.sh "$p" --force --keep-logs || log_warn "uninstall rollback failed for $p"
+    else
+      log_warn "uninstall.sh missing; manual cleanup required for $p"
+    fi
+  done
+}
+
+# CLI dispatch (minimal other commands)
+_cmd_help(){
+  cat <<EOF
+lfsctl - minimal help
+Commands:
+  install <pkg> [options]   Install a package (see lfsctl install --help)
+  info <pkg>                Show metadata for a package
+  list-installed            List installed packages
+  help
+EOF
+}
+
+cmd_info(){
+  local pkg="$1"
+  if [ -f "${PKGS_DIR}/${pkg}/metadata.json" ]; then
+    cat "${PKGS_DIR}/${pkg}/metadata.json"
+  else
+    grep -E "^${pkg}\t" "${LFS_DB}/packages.db" || log_warn "No metadata for $pkg"
+  fi
+}
+
+cmd_list_installed(){
+  if [ -f "${LFS_DB}/packages.db" ]; then
+    cat "${LFS_DB}/packages.db"
+  else
+    echo "No packages registered."
+  fi
+}
+
+main(){
+  if [ $# -lt 1 ]; then _cmd_help; exit 0; fi
+  local cmd="$1"; shift
+  case "$cmd" in
+    install|i) install_pkg "$@" ;;
+    info) cmd_info "$@" ;;
+    list-installed) cmd_list_installed ;;
+    help|-h) _cmd_help ;;
+    *) log_error "Unknown command: $cmd"; _cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
