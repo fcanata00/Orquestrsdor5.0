@@ -1,0 +1,5 @@
+--- a/Makefile
++++ b/Makefile
+@@ -20,6 +20,7 @@
+ CFLAGS += -O2
++LDFLAGS += -flto

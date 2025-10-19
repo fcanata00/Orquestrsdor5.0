@@ -1,0 +1,5 @@
+--- a/configure
++++ b/configure
+@@ -120,6 +120,7 @@
+ export PATH=/usr/local/bin:$PATH
++export LDFLAGS='-Wl,-O1'
